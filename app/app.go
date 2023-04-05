@@ -87,6 +87,14 @@ import (
 	ibchost "github.com/cosmos/ibc-go/v3/modules/core/24-host"
 	ibckeeper "github.com/cosmos/ibc-go/v3/modules/core/keeper"
 
+	ibchooks "github.com/aura-nw/aura/x/ibc-hooks"
+	ibchookskeeper "github.com/aura-nw/aura/x/ibc-hooks/keeper"
+	ibchookstypes "github.com/aura-nw/aura/x/ibc-hooks/types"
+
+	packetforward "github.com/strangelove-ventures/packet-forward-middleware/v3/router"
+	packetforwardkeeper "github.com/strangelove-ventures/packet-forward-middleware/v3/router/keeper"
+	packetforwardtypes "github.com/strangelove-ventures/packet-forward-middleware/v3/router/types"
+
 	"github.com/spf13/cast"
 	abci "github.com/tendermint/tendermint/abci/types"
 	tmjson "github.com/tendermint/tendermint/libs/json"
@@ -279,12 +287,14 @@ type App struct {
 	CrisisKeeper     crisiskeeper.Keeper
 	UpgradeKeeper    upgradekeeper.Keeper
 	ParamsKeeper     paramskeeper.Keeper
-	IBCKeeper        *ibckeeper.Keeper // IBC Keeper must be a pointer in the app, so we can SetRouter on it correctly
+	IBCKeeper        *ibckeeper.Keeper      // IBC Keeper must be a pointer in the app, so we can SetRouter on it correctly
+	IBCHooksKeeper   *ibchookskeeper.Keeper // IBC Hooks Keeper
 	EvidenceKeeper   evidencekeeper.Keeper
 	TransferKeeper   ibctransferkeeper.Keeper
 	FeeGrantKeeper   feegrantkeeper.Keeper
 	AuthzKeeper      authzkeeper.Keeper
 	WasmKeeper       wasm.Keeper
+	ContractKeeper   *wasmkeeper.PermissionedKeeper
 
 	// make scoped keepers public for test purposes
 	ScopedIBCKeeper      capabilitykeeper.ScopedKeeper
@@ -300,6 +310,14 @@ type App struct {
 
 	// the configurator
 	configurator module.Configurator
+
+	// IBC modules
+	// transfer module
+	RawIcs20TransferAppModule transfer.AppModule
+	TransferStack             *ibchooks.IBCMiddleware
+	Ics20WasmHooks            *ibchooks.WasmHooks
+	HooksICS4Wrapper          ibchooks.ICS4Middleware
+	PacketForwardKeeper       *packetforwardkeeper.Keeper
 }
 
 // New returns a reference to an initialized Gaia.
@@ -332,6 +350,7 @@ func New(
 		auramoduletypes.StoreKey,
 		authzkeeper.StoreKey,
 		wasm.StoreKey,
+		ibchookstypes.StoreKey, packetforwardtypes.StoreKey,
 		// this line is used by starport scaffolding # stargate/app/storeKey
 	)
 	tkeys := sdk.NewTransientStoreKeys(paramstypes.TStoreKey)
@@ -416,6 +435,14 @@ func New(
 		appCodec, keys[ibchost.StoreKey], app.GetSubspace(ibchost.ModuleName), app.StakingKeeper, app.UpgradeKeeper, scopedIBCKeeper,
 	)
 
+	// Configure the hooks keeper
+	hooksKeeper := ibchookskeeper.NewKeeper(
+		keys[ibchookstypes.StoreKey],
+	)
+	app.IBCHooksKeeper = &hooksKeeper
+
+	app.WireICS20PreWasmKeeper(appCodec, bApp, app.IBCHooksKeeper)
+
 	// register the proposal types
 	govRouter := govtypes.NewRouter()
 	govRouter.AddRoute(govtypes.RouterKey, govtypes.ProposalHandler).
@@ -423,21 +450,6 @@ func New(
 		AddRoute(distrtypes.RouterKey, distr.NewCommunityPoolSpendProposalHandler(app.DistrKeeper)).
 		AddRoute(upgradetypes.RouterKey, upgrade.NewSoftwareUpgradeProposalHandler(app.UpgradeKeeper)).
 		AddRoute(ibcclienttypes.RouterKey, ibcclient.NewClientProposalHandler(app.IBCKeeper.ClientKeeper))
-
-	// Create Transfer Keepers
-	app.TransferKeeper = ibctransferkeeper.NewKeeper(
-		appCodec,
-		keys[ibctransfertypes.StoreKey],
-		app.GetSubspace(ibctransfertypes.ModuleName),
-		app.IBCKeeper.ChannelKeeper,
-		app.IBCKeeper.ChannelKeeper,
-		&app.IBCKeeper.PortKeeper,
-		app.AccountKeeper,
-		app.BankKeeper,
-		scopedTransferKeeper,
-	)
-	transferModule := transfer.NewAppModule(app.TransferKeeper)
-	transferIBCModule := transfer.NewIBCModule(app.TransferKeeper)
 
 	// Create evidence Keeper for to register the IBC light client misbehaviour evidence route
 	evidenceKeeper := evidencekeeper.NewKeeper(
@@ -451,7 +463,7 @@ func New(
 
 	// Create static IBC router, add transfer route, then set and seal it
 	ibcRouter := ibcporttypes.NewRouter()
-	ibcRouter.AddRoute(ibctransfertypes.ModuleName, transferIBCModule)
+	ibcRouter.AddRoute(ibctransfertypes.ModuleName, app.TransferStack)
 
 	// ------ CosmWasm setup ------
 	wasmDir := filepath.Join(homePath, "wasm")
@@ -495,6 +507,10 @@ func New(
 		&stakingKeeper, govRouter,
 	)
 
+	// Pass the contract keeper to all the structs (generally ICS4Wrappers for ibc middlewares) that need it
+	app.ContractKeeper = wasmkeeper.NewDefaultPermissionKeeper(app.WasmKeeper)
+	app.Ics20WasmHooks.ContractKeeper = app.ContractKeeper
+
 	// Add wasm module route to the ibc router, then set and seal it
 	ibcRouter.AddRoute(wasm.ModuleName, wasm.NewIBCHandler(app.WasmKeeper, app.IBCKeeper.ChannelKeeper))
 	app.IBCKeeper.SetRouter(ibcRouter)
@@ -529,7 +545,9 @@ func New(
 		evidence.NewAppModule(app.EvidenceKeeper),
 		ibc.NewAppModule(app.IBCKeeper),
 		params.NewAppModule(app.ParamsKeeper),
-		transferModule,
+		ibchooks.NewAppModule(app.AccountKeeper),
+		packetforward.NewAppModule(app.PacketForwardKeeper),
+		app.RawIcs20TransferAppModule,
 		auraModule,
 		wasm.NewAppModule(appCodec, &app.WasmKeeper, app.StakingKeeper, app.AccountKeeper, app.BankKeeper),
 		// this line is used by starport scaffolding # stargate/app/appModule
@@ -559,6 +577,8 @@ func New(
 		// additional non simd modules
 		ibchost.ModuleName,
 		ibctransfertypes.ModuleName,
+		packetforwardtypes.ModuleName,
+		ibchookstypes.ModuleName,
 		auramoduletypes.ModuleName,
 		wasm.ModuleName,
 	)
@@ -583,6 +603,8 @@ func New(
 		// additional non simd modules
 		ibchost.ModuleName,
 		ibctransfertypes.ModuleName,
+		packetforwardtypes.ModuleName,
+		ibchookstypes.ModuleName,
 		auramoduletypes.ModuleName,
 		wasm.ModuleName,
 	)
@@ -606,6 +628,8 @@ func New(
 		genutiltypes.ModuleName,
 		evidencetypes.ModuleName,
 		ibctransfertypes.ModuleName,
+		packetforwardtypes.ModuleName,
+		ibchookstypes.ModuleName,
 		auramoduletypes.ModuleName,
 		feegrant.ModuleName,
 		authz.ModuleName,
@@ -633,6 +657,8 @@ func New(
 		slashingtypes.ModuleName,
 		stakingtypes.ModuleName,
 		ibctransfertypes.ModuleName,
+		packetforwardtypes.ModuleName,
+		ibchookstypes.ModuleName,
 		paramstypes.ModuleName,
 		upgradetypes.ModuleName,
 		vestingtypes.ModuleName,
@@ -704,6 +730,63 @@ func New(
 	app.ScopedWasmKeeper = scopedWasmKeeper
 	// this line is used by starport scaffolding # stargate/app/beforeInitReturn
 	return app
+}
+
+func (app *App) WireICS20PreWasmKeeper(
+	appCodec codec.Codec,
+	bApp *baseapp.BaseApp,
+	hooksKeeper *ibchookskeeper.Keeper,
+) {
+	// Setup the ICS4Wrapper used by the hooks middleware
+	auraPrefix := sdk.GetConfig().GetBech32AccountAddrPrefix()
+	wasmHooks := ibchooks.NewWasmHooks(hooksKeeper, nil, auraPrefix) // The contract keeper needs to be set later
+	app.Ics20WasmHooks = &wasmHooks
+	app.HooksICS4Wrapper = ibchooks.NewICS4Middleware(
+		app.IBCKeeper.ChannelKeeper,
+		app.Ics20WasmHooks,
+	)
+
+	// Create Transfer Keepers
+	transferKeeper := ibctransferkeeper.NewKeeper(
+		appCodec,
+		app.keys[ibctransfertypes.StoreKey],
+		app.GetSubspace(ibctransfertypes.ModuleName),
+		app.IBCKeeper.ChannelKeeper,
+		app.IBCKeeper.ChannelKeeper,
+		&app.IBCKeeper.PortKeeper,
+		app.AccountKeeper,
+		app.BankKeeper,
+		app.ScopedTransferKeeper,
+	)
+	app.TransferKeeper = transferKeeper
+	app.RawIcs20TransferAppModule = transfer.NewAppModule(app.TransferKeeper)
+
+	// Packet Forward Middleware
+	// Initialize packet forward middleware router
+
+	app.PacketForwardKeeper = packetforwardkeeper.NewKeeper(
+		appCodec,
+		app.keys[packetforwardtypes.StoreKey],
+		app.GetSubspace(packetforwardtypes.ModuleName),
+		app.TransferKeeper,
+		app.IBCKeeper.ChannelKeeper,
+		app.DistrKeeper,
+		app.BankKeeper,
+		// The ICS4Wrapper is replaced by the HooksICS4Wrapper instead of the channel so that sending can be overridden by the middleware
+		app.HooksICS4Wrapper,
+	)
+
+	packetForwardMiddleware := packetforward.NewIBCMiddleware(
+		transfer.NewIBCModule(app.TransferKeeper),
+		app.PacketForwardKeeper,
+		0,
+		packetforwardkeeper.DefaultForwardTransferPacketTimeoutTimestamp,
+		packetforwardkeeper.DefaultRefundTransferPacketTimeoutTimestamp,
+	)
+
+	// Hooks Middleware
+	hooksTransferModule := ibchooks.NewIBCMiddleware(&packetForwardMiddleware, &app.HooksICS4Wrapper)
+	app.TransferStack = &hooksTransferModule
 }
 
 // Name returns the name of the App
@@ -851,6 +934,7 @@ func initParamsKeeper(appCodec codec.BinaryCodec, legacyAmino *codec.LegacyAmino
 	paramsKeeper.Subspace(auramoduletypes.ModuleName)
 	paramsKeeper.Subspace(wasm.ModuleName)
 	// this line is used by starport scaffolding # stargate/app/paramSubspace
+	paramsKeeper.Subspace(packetforwardtypes.ModuleName).WithKeyTable(packetforwardtypes.ParamKeyTable())
 
 	return paramsKeeper
 }
